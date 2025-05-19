@@ -73,114 +73,114 @@ export function FileUploader() {
     }
   };
 
+  // Worker池管理
+  const workerPool = useRef<{worker: any; busy: boolean}[]>([]);
+  const MAX_WORKERS = 4; // 根据CPU核心数调整
+
+  // 初始化worker池
+  const initWorkerPool = async () => {
+    for (let i = 0; i < MAX_WORKERS; i++) {
+      const worker = await createWorker("chi_sim+eng");
+      workerPool.current.push({worker, busy: false});
+    }
+  };
+
+  // 获取空闲worker
+  const getAvailableWorker = async () => {
+    // 如果池为空，初始化
+    if (workerPool.current.length === 0) {
+      await initWorkerPool();
+    }
+
+    // 查找空闲worker
+    const available = workerPool.current.find(w => !w.busy);
+    if (available) {
+      available.busy = true;
+      return available.worker;
+    }
+
+    // 如果没有空闲worker，等待
+    return new Promise(resolve => {
+      const check = () => {
+        const worker = workerPool.current.find(w => !w.busy);
+        if (worker) {
+          worker.busy = true;
+          resolve(worker.worker);
+        } else {
+          setTimeout(check, 100);
+        }
+      };
+      check();
+    });
+  };
+
+  // 释放worker
+  const releaseWorker = (worker: any) => {
+    const poolWorker = workerPool.current.find(w => w.worker === worker);
+    if (poolWorker) {
+      poolWorker.busy = false;
+    }
+  };
+
   const processPdf = async (pdfFile: File): Promise<string> => {
     if (!pdfjs) {
       throw new Error("PDF.js library not loaded");
     }
 
-    const arrayBuffer = await pdfFile.arrayBuffer();
-    const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-    let fullText = "";
+    // 文件大小限制 (10MB)
+    if (pdfFile.size > 10 * 1024 * 1024) {
+      throw new Error("PDF文件大小超过10MB限制");
+    }
 
-    // Create a canvas element if it doesn't exist
-    if (!canvasRef.current) {
+    const arrayBuffer = await pdfFile.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ 
+      data: arrayBuffer,
+      disableFontFace: true, // 禁用字体加载
+      disableAutoFetch: true // 禁用自动获取
+    }).promise;
+
+    // 创建多个canvas用于并行渲染
+    const canvases = Array.from({length: MAX_WORKERS}, () => {
       const canvas = document.createElement("canvas");
       canvas.style.display = "none";
       document.body.appendChild(canvas);
-      canvasRef.current = canvas;
+      return canvas;
+    });
+
+    try {
+      // 并行处理页面
+      const pagePromises = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        pagePromises.push(processPdfPage(pdf, i, canvases[(i-1) % MAX_WORKERS]));
+      }
+
+      // 更新进度
+      const interval = setInterval(() => {
+        const done = pagePromises.filter(p => p.status === 'fulfilled').length;
+        setProgress(Math.floor((done / pdf.numPages) * 100));
+      }, 500);
+
+      const results = await Promise.all(pagePromises);
+      clearInterval(interval);
+      setProgress(100);
+
+      return results.join("\n\n");
+    } finally {
+      // 清理canvas
+      canvases.forEach(canvas => canvas.remove());
     }
+  };
 
-    const worker = await createWorker("chi_sim+eng");
+  const processPdfPage = async (pdf: any, pageNum: number, canvas: HTMLCanvasElement): Promise<string> => {
+    const worker = await getAvailableWorker();
+    try {
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 1.0 }); // 降低渲染质量
 
-    for (let i = 1; i <= pdf.numPages; i++) {
-      // Update progress
-      setProgress(Math.floor((i / pdf.numPages) * 100));
-
-      // Get the page
-      const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: 1.5 });
-
-      // Prepare canvas for rendering
-      const canvas = canvasRef.current;
       const context = canvas.getContext("2d");
       canvas.height = viewport.height;
       canvas.width = viewport.width;
 
-      // Render PDF page to canvas
-      await page.render({
-        canvasContext: context!,
-        viewport: viewport,
-      }).promise;
-
-      // Convert canvas to image data
-      const imageData = canvas.toDataURL("image/png");
-
-      // Recognize text from the image
-      const { data } = await worker.recognize(imageData);
-      fullText += data.text + "\n\n";
-    }
-
-    await worker.terminate();
-    return fullText;
-  };
-
-  const processImage = async (imageFile: File): Promise<string> => {
-    const worker = await createWorker("chi_sim+eng");
-    const { data } = await worker.recognize(imageFile);
-    await worker.terminate();
-    return data.text;
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!file) {
-      toast({
-        title: "请选择文件",
-        description: "请上传图片或PDF文件进行文本识别",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    try {
-      setIsProcessing(true);
-      setProgress(0);
-
-      let extractedText = "";
-
-      if (file.type === "application/pdf") {
-        if (!pdfjs) {
-          throw new Error(
-            "PDF.js library not loaded. Please try again or use an image file instead."
-          );
-        }
-        extractedText = await processPdf(file);
-      } else if (file.type.startsWith("image/")) {
-        extractedText = await processImage(file);
-      }
-
-      // Store the extracted text in localStorage
-      localStorage.setItem("extractedText", extractedText);
-
-      // Force a re-render of the results component
-      window.dispatchEvent(new Event("storage"));
-
-      toast({
-        title: "处理完成",
-        description: "文本识别已完成",
-      });
-    } catch (error) {
-      console.error("Error processing file:", error);
-      toast({
-        title: "处理失败",
-        description:
-          error instanceof Error
-            ? error.message
-            : "文件处理过程中出现错误，请重试",
-        variant: "destructive",
-      });
-    } finally {
       setIsProcessing(false);
       setProgress(0);
     }
