@@ -27,11 +27,9 @@ export function FileUploader() {
           // 从本地node_modules加载
           const pdfjsLib = await import("pdfjs-dist");
 
-          // 设置worker路径
-          pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-            "pdfjs-dist/build/pdf.worker.min.js",
-            import.meta.url
-          ).toString();
+          // 设置worker路径 - 使用公共路径
+          const workerSrc = "/pdf.worker.min.mjs";
+          pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
 
           setPdfjs(pdfjsLib);
         } catch (error) {
